@@ -1,0 +1,110 @@
+name: Build and promote (dev, staging, prod)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      simulate_failure_in:
+        description: Deliberately fail the smoke test in this environment to test rollback
+        type: choice
+        options: [none, dev, staging, prod]
+        default: none
+permissions:
+  contents: read
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.3
+          terraform_wrapper: false
+      - name: Terraform format and validate
+        run: |
+          terraform fmt -check -recursive
+          for dir in infra bootstrap; do
+            (cd "$dir" && terraform init -backend=false -input=false && terraform validate)
+          done
+      - name: Shell script checks
+        run: |
+          for f in scripts/*.sh; do bash -n "$f"; done
+          shellcheck -S warning scripts/*.sh
+
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      simulate_failure_in: ${{ steps.sim.outputs.simulate_failure_in }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        shell: bash
+        run: echo "version=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - id: sim
+        name: Decide whether to simulate a failure
+        shell: bash
+        env:
+          INPUT_SIM: ${{ inputs.simulate_failure_in }}
+        run: |
+          # A manual run input wins; otherwise read simulate-failure.txt so a normal push can trigger the simulation.
+          sim="${INPUT_SIM:-none}"
+          if [ "$sim" = "none" ] && [ -f simulate-failure.txt ]; then
+            sim="$(tr -d '[:space:]' < simulate-failure.txt)"
+          fi
+          case "$sim" in
+            none|dev|staging|prod) ;;
+            *) echo "::error::simulate-failure.txt must contain none, dev, staging or prod (got '$sim')"; exit 1 ;;
+          esac
+          if [ "$sim" != "none" ]; then
+            echo "::warning::Failure simulation requested for: $sim"
+          fi
+          echo "simulate_failure_in=$sim" >> "$GITHUB_OUTPUT"
+      - name: Unit tests and build once
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q "Hello World" app/index.html
+          grep -q "__VERSION__" app/index.html
+          rm -rf build && mkdir build
+          sed "s/__VERSION__/${GITHUB_SHA::7}/g" app/index.html > build/index.html
+          cp app/health.txt build/health.txt
+          test "$(cat build/health.txt)" = "OK"
+          grep -q "Version: ${GITHUB_SHA::7}" build/index.html
+          (cd build && zip -r ../hello-world.zip .)
+          sha256sum hello-world.zip > hello-world.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hello-world-${{ steps.meta.outputs.version }}
+          path: |
+            hello-world.zip
+            hello-world.zip.sha256
+          retention-days: 14
+          if-no-files-found: error
+
+  dev:
+    needs: [lint, build]
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: dev
+      version: ${{ needs.build.outputs.version }}
+      simulate_failure: ${{ needs.build.outputs.simulate_failure_in == 'dev' }}
+    secrets: inherit
+
+  staging:
+    needs: [build, dev]
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: staging
+      version: ${{ needs.build.outputs.version }}
+      simulate_failure: ${{ needs.build.outputs.simulate_failure_in == 'staging' }}
+    secrets: inherit
+
+  prod:
+    needs: [build, staging]
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: prod
+      version: ${{ needs.build.outputs.version }}
+      simulate_failure: ${{ needs.build.outputs.simulate_failure_in == 'prod' }}
+    secrets: inherit
